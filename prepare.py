@@ -18,6 +18,7 @@ import pickle
 from multiprocessing import Pool
 
 import requests
+from tqdm import tqdm
 import pyarrow.parquet as pq
 import rustbpe
 import tiktoken
@@ -51,45 +52,156 @@ SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
 BOS_TOKEN = "<|reserved_0|>"
 
 # ---------------------------------------------------------------------------
+# Download helpers
+# ---------------------------------------------------------------------------
+
+# Cap download speed (bytes/sec). Reduces SSL EOF errors on congested links.
+# Set to None to disable throttling.
+DOWNLOAD_SPEED_LIMIT = 5 * 1024 * 1024  # 5 MB/s per shard
+
+def _make_session():
+    """
+    Build a requests.Session that:
+    - Bypasses broken system proxies
+    - Uses a larger chunk size + retry-friendly timeouts
+    """
+    session = requests.Session()
+    # Use system proxy env vars (https_proxy etc.) — required on this machine
+    session.trust_env = True
+    return session
+
+
+def _throttled_write(f, chunk: bytes, speed_limit: int, t_last: list, bytes_written: list):
+    """
+    Write chunk to file and sleep if we're exceeding speed_limit bytes/sec.
+    t_last and bytes_written are single-element lists used as mutable state.
+    """
+    f.write(chunk)
+    bytes_written[0] += len(chunk)
+    elapsed = time.monotonic() - t_last[0]
+    if elapsed > 0:
+        current_speed = bytes_written[0] / elapsed
+        if speed_limit and current_speed > speed_limit:
+            sleep_time = bytes_written[0] / speed_limit - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+# ---------------------------------------------------------------------------
 # Data download
 # ---------------------------------------------------------------------------
 
 def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
+    """Download one parquet shard with retries and progress bar. Returns True on success."""
     filename = f"shard_{index:05d}.parquet"
     filepath = os.path.join(DATA_DIR, filename)
     if os.path.exists(filepath):
         return True
 
     url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
+    max_attempts = 10
+    base_backoff = 5
+    chunk_size = 256 * 1024     # 256 KB
+
+    session = _make_session()
+
     for attempt in range(1, max_attempts + 1):
+        temp_path = filepath + ".tmp"
+        downloaded = 0
+
+        # Resume from partial file if available
+        headers = {}
+        if os.path.exists(temp_path):
+            downloaded = os.path.getsize(temp_path)
+            if downloaded > 0:
+                headers["Range"] = f"bytes={downloaded}-"
+
         try:
-            response = requests.get(url, stream=True, timeout=30)
+            response = session.get(
+                url,
+                stream=True,
+                timeout=(15, 60),
+                headers=headers,
+                verify=True,
+            )
+
+            if response.status_code == 416:
+                if os.path.exists(temp_path):
+                    os.rename(temp_path, filepath)
+                    return True
             response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
+
+            # Total size for progress bar (Content-Range or Content-Length)
+            total = None
+            content_range = response.headers.get("Content-Range")
+            if content_range:
+                # e.g. "bytes 1024-999999/1000000"
+                try:
+                    total = int(content_range.split("/")[-1])
+                except ValueError:
+                    pass
+            if total is None:
+                try:
+                    total = int(response.headers.get("Content-Length", 0)) + downloaded
+                except ValueError:
+                    pass
+
+            mode = "ab" if downloaded > 0 else "wb"
+            t_last = [time.monotonic()]
+            bytes_written = [0]
+
+            attempt_label = f" (attempt {attempt}/{max_attempts})" if attempt > 1 else ""
+            with tqdm(
+                total=total,
+                initial=downloaded,
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                desc=f"  {filename}{attempt_label}",
+                leave=True,
+                dynamic_ncols=True,
+            ) as bar:
+                with open(temp_path, mode) as f:
+                    for chunk in response.iter_content(chunk_size=chunk_size):
+                        if chunk:
+                            if DOWNLOAD_SPEED_LIMIT:
+                                _throttled_write(f, chunk, DOWNLOAD_SPEED_LIMIT, t_last, bytes_written)
+                            else:
+                                f.write(chunk)
+                            bar.update(len(chunk))
+
             os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
             return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
+
+        except (requests.RequestException, IOError, OSError) as e:
+            err_str = str(e)
+            tqdm.write(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {err_str}")
+
+            is_ssl_eof = "EOF" in err_str or "UNEXPECTED_EOF" in err_str
+            if not is_ssl_eof:
+                if os.path.exists(temp_path):
                     try:
-                        os.remove(path)
+                        os.remove(temp_path)
                     except OSError:
                         pass
+
             if attempt < max_attempts:
-                time.sleep(2 ** attempt)
+                backoff = min(base_backoff * (2 ** (attempt - 1)), 120)
+                tqdm.write(f"    Retrying in {backoff}s ...")
+                time.sleep(backoff)
+
+    if os.path.exists(temp_path):
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
     return False
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
+def download_data(num_shards, download_workers=3):
+    """
+    Download training shards + pinned validation shard.
+    Default workers reduced to 3 to avoid overwhelming unstable connections.
+    """
     os.makedirs(DATA_DIR, exist_ok=True)
     num_train = min(num_shards, MAX_SHARD)
     ids = list(range(num_train))
@@ -104,13 +216,19 @@ def download_data(num_shards, download_workers=8):
 
     needed = len(ids) - existing
     print(f"Data: downloading {needed} shards ({existing} already exist)...")
+    print(f"      Workers: {download_workers}, speed limit: "
+          f"{DOWNLOAD_SPEED_LIMIT // (1024*1024) if DOWNLOAD_SPEED_LIMIT else 'unlimited'} MB/s per shard")
 
     workers = max(1, min(download_workers, needed))
     with Pool(processes=workers) as pool:
         results = pool.map(download_single_shard, ids)
 
     ok = sum(1 for r in results if r)
+    failed = [f"shard_{ids[i]:05d}.parquet" for i, r in enumerate(results) if not r]
     print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+    if failed:
+        print(f"  Failed shards: {', '.join(failed)}")
+        print("  Tip: re-run the script — failed shards will be retried/resumed automatically.")
 
 # ---------------------------------------------------------------------------
 # Tokenizer training
@@ -370,9 +488,19 @@ def evaluate_bpb(model, tokenizer, batch_size):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser.add_argument("--num-shards", type=int, default=10,
+                        help="Number of training shards to download (-1 = all). Val shard is always pinned.")
+    parser.add_argument("--download-workers", type=int, default=3,
+                        help="Parallel download workers (default 3; lower = more stable on bad networks)")
+    parser.add_argument("--speed-limit", type=int, default=5,
+                        help="Per-shard download speed limit in MB/s (default 5; 0 = unlimited)")
     args = parser.parse_args()
+
+    # Apply speed limit from CLI
+    if args.speed_limit > 0:
+        DOWNLOAD_SPEED_LIMIT = args.speed_limit * 1024 * 1024
+    else:
+        DOWNLOAD_SPEED_LIMIT = None
 
     num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
 
